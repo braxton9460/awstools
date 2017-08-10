@@ -9,14 +9,14 @@ Requires:
 * A master credentials file
 * `AWS_HOME` Bash environment variable set to the aws home where the credentials live (e.g ~/.aws)
 
-**Master Credentials File**
-Should be located at `AWS_HOME/master_credentials.yaml`
-There are 3 possible types of entries
-1) Root credentials account (or IAM Account no/MFA)
-2) IAM Account with MFA
-3) Role based account that is delegated from another account
+**Master Credentials File**  
+Should be located at `AWS_HOME/master_credentials.yaml`  
+There are 3 possible types of entries  
+1) Root credentials account (or IAM Account no/MFA)  
+2) IAM Account with MFA  
+3) Role based account that is delegated from another account  
 
-FORMAT (with all possible parameters):
+FORMAT (with all possible parameters):  
 ```
 <Title>:
     aws_access_key_id: <key>
@@ -30,16 +30,14 @@ FORMAT (with all possible parameters):
     parent_account: <Title-of-parent-account>
 ```
 ----
-PARAMETERS:
-
-To select, you must always provide all 4 below, plus the parameters from one of the options below.
-
-`aws_access_key_id`: (Required All Options)
-`aws_secret_access_key`: (Required All Options)
-`region`: (Required All Options)
-`output`: (Required All Options)
-**Option 1)**
-`root`: (Required)
+PARAMETERS:  
+To select, you must always provide all 4 below, plus the parameters from one of the options below  
+`aws_access_key_id`: (Required All Options)  
+`aws_secret_access_key`: (Required All Options)  
+`region`: (Required All Options)  
+`output`: (Required All Options)  
+**Option 1)**  
+`root`: (Required)  
 Example:
 ```
 my_root_account:
@@ -49,9 +47,9 @@ my_root_account:
   output: json
   root: true
 ```
-**Option 2)**
-`iam_number`: (Required)
-`iam_user`: (Required)
+**Option 2)**  
+`iam_number`: (Required)  
+`iam_user`: (Required)  
 Example:
 ```
 my_auth_account:
@@ -62,10 +60,10 @@ my_auth_account:
   iam_number: '2837479202134'
   iam_user: 'username'
 ```
-**Option 3)**
-`iam_role`: (Required)
-`iam_number`: (Required)
-`parent_account`: (Required)
+**Option 3)**  
+`iam_role`: (Required)  
+`iam_number`: (Required)  
+`parent_account`: (Required)  
 Example:
 ```
 my_delegated_account:
