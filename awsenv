@@ -1,0 +1,52 @@
+#!/bin/bash
+#
+# A tool to set environment variables with settings from the aws credentials file
+# @author Braxton Householder
+#
+
+# This has to be a function so that it is sourced in our shell
+awsenv() {
+  # Find the file
+  credentials_file="$AWS_HOME/credentials"
+
+  # Input
+  profile_name=$1
+  if [ -z "$profile_name" ];then
+    echo "Missing profile name"
+    echo "Usage: awsenv <profile name>"
+    return
+  fi
+
+  # Get details about the profiles
+  desired_profile=$(egrep -n "^\[$profile_name" $credentials_file | awk -F: '{print $1}')
+  matched_profile_name=$(cat $credentials_file | sed -n "${desired_profile}p" | sed -E 's/\[|\]//g')
+  next_profile=$(egrep -n '^\[' $credentials_file | grep -A1 "\[$profile_name" | tr ' ' '\n' | tail -1 | awk -F: '{print $1}')
+ 
+  # Check if we have the last record
+  if [ "$desired_profile" == "$next_profile" ];then
+    # We have the last one
+    output=$(sed -n "${desired_profile},\$p" $credentials_file | egrep -v '^\[|^#' | sed 's/ = /=/g')
+  else
+    # Otherwise just look forward to the next profile start
+    output=$(sed -n "$desired_profile,${next_profile}p" $credentials_file | egrep -v '^\[|^#' | sed 's/ = /=/g')
+  fi
+
+  # Now, unset everything, so we start fresh
+  unset AWS_ACCESS_KEY_ID
+  unset AWS_SECRET_ACCESS_KEY
+  unset AWS_SESSION_TOKEN
+  # Now iterate through and set this shiz
+  # Note: For some reason, the export doesn't work in the sed 'while read line' method
+  for i in $output;do
+    key=$(echo $i | awk -F\= '{print $1}' | tr '[:lower:]' '[:upper:]')
+    value=$(echo $i | awk -F\= '{print $2}')
+    export $key=$value
+    if [ "$?" -ne 0 ];then
+      echo "Failure to set value (Profile: $matched_profile_name). Bailing out!"
+      exit 1
+    fi
+  done
+
+  echo "Success (Profile: $matched_profile_name)"
+
+}

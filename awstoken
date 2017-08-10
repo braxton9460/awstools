@@ -1,0 +1,323 @@
+#!/usr/local/bin/ruby
+#
+#
+# This serves to get new aws session tokens and save them out as necessary
+# plus interpret json - 6/15/2015
+# Re-worked to support a yaml master file & nice output and expiration handling - 6/28/2016
+# @author Braxton Householder
+#
+
+# Requires
+require 'json'
+require 'yaml'
+require 'date'
+require 'time_difference'
+require 'pp'
+
+# Params
+if !ENV['AWS_HOME'].nil?
+  aws_home = ENV['AWS_HOME']
+else
+  puts "Missing AWS Home ENV variable"
+  puts "Please set 'AWS_HOME' and retry"
+  exit 1
+end
+master_file = "#{aws_home}/master_credentials.yaml" # The file with the permanent IAM codes
+@tokenization_file = "#{aws_home}/token_credentials.json" # The file with the temporary IAM codes
+credentials_file = "#{aws_home}/credentials"
+config_file = "#{aws_home}/config"
+privacy_file = "#{aws_home}/privacy"
+iam_key_duration = 10800
+
+# Read in master file
+if File.exist?(master_file)
+#  file = File.read(master_file)
+  @master_data = YAML.load_file(master_file)
+else
+  puts "Error! Master file does not exist"
+  exit 1
+end
+
+# Read in token file
+if File.exist?(@tokenization_file)
+  token_file = File.read(@tokenization_file)
+  @token_data = JSON.parse(token_file)
+else
+  @token_data = {}
+end
+
+# Read in privacy file
+@privacy_string = nil
+if File.exist?(privacy_file)
+  priv_file = File.read(privacy_file).strip
+  # Make sure we don't nuke our nil default for an empty string or something
+  if priv_file.length > 1
+    @privacy_string = priv_file
+  end
+end
+
+# Function to list profiles found in master file
+def list_profiles
+  output_profiles = {}
+  profiles = []
+  @master_data.keys.each { |k| profiles.push(k) }
+
+  # Filter list of profiles
+  if @privacy_string
+    profiles = profiles.select { |p| p[/^#{@privacy_string}/] }
+  end
+  output = "Available Profiles: \n"
+  profiles.each do |profile|
+    expire_time_remain = nil
+    expire_output = 'Exp: Unknown'
+    # Check if we have token data for that
+    unless @token_data[profile].nil?
+      current_time = DateTime.now
+      expire_time = DateTime.rfc3339(@token_data[profile]['expiration'])
+      # Check if we are past expiration
+      if expire_time <= current_time
+        expire_output = 'Expired!'
+      else
+        expire_time_remain = TimeDifference.between(expire_time, current_time).in_general
+        expire_output = "Exp: #{expire_time_remain[:hours]} Hours and #{expire_time_remain[:minutes]} Minutes"
+      end
+    end
+    # Check if these are root keys
+    if @master_data[profile]['root']
+      expire_output = 'Root Keys - No Exp / No MFA'
+    elsif ! @master_data[profile]['iam_number']
+      expire_output = 'IAM - No MFA'
+    end
+    
+    # Check where we need to dump the data
+    if @master_data[profile]['parent_account']
+      parent_profile = @master_data[profile]['parent_account']
+      # Ensure this structure always already exists
+      output_profiles[parent_profile] = {} unless output_profiles[parent_profile].is_a?(Hash)
+      output_profiles[parent_profile]['role_accounts'] = {} unless output_profiles[parent_profile]['role_accounts'].is_a?(Hash)
+
+      # Then put these underneath the parent
+      output_profiles[parent_profile]['role_accounts'][profile] = expire_output
+    else
+      # Assume we need to dump it in the regular place
+      output_profiles[profile] = {} unless output_profiles[profile].is_a?(Hash)
+      output_profiles[profile]['expire'] = expire_output
+    end
+  end
+  # Now build the output
+  output_profiles.each do |profile, data|
+    # output the parent first
+    output << " - #{profile} (#{data['expire']})\n"
+    unless data['role_accounts'].nil?
+      # Now output each of the children
+      data['role_accounts'].each do |role_account, expire_data|
+        output << "   - #{role_account} (#{expire_data})\n"
+      end
+    end
+  end
+  return output 
+  
+end
+
+# Function finds the profile in the master file based on input
+def find_profile (profile_name)
+  # Find the matching profile
+  profile_data = @master_data.select { |p, d| p[/^#{profile_name}/] }
+  profile_count = profile_data.count
+  if profile_count > 1
+    puts "Profile match not specific enough. Please refine match"
+    exit 1
+  elsif profile_count < 1
+    puts "Unable to find profile"
+    exit 1
+  end
+  return profile_data.first
+end
+
+# Function check if keys are valid or expired
+def keys_valid (full_profile_name)
+  # Check if we actually need to be refreshing this token (if this data is already set)
+  # Amazon uses (or close enough to) the rfc3339 datetime standard
+  unless @token_data[full_profile_name].nil?
+    expire_time = DateTime.rfc3339(@token_data[full_profile_name]['expiration'])
+    current_time = DateTime.now
+    # This is to allow us to renew them within 10minutes of them expiring
+    if (expire_time - 600) < current_time and expire_time > current_time
+      puts "Within 10min of expiration. Allowing early renew."
+      return false
+    elsif expire_time > current_time
+      # Then we are good to go
+      return true
+    else
+      # The keys are expired (i.e not valid)
+      return false
+    end
+  end
+end
+
+# Function hits amazon and auths with MFA token to get temporary api keys
+def mfa_auth (full_profile, profile_data, iam_key_duration, token_code)
+  # Get amazon datas
+  # We can use local to this script only environment variables & aws cli will be happy
+  # which makes us happy
+  # Also, cleanup the current env variables, so we don't get confused
+  ENV.delete('AWS_ACCESS_KEY_ID')
+  ENV.delete('AWS_SECRET_ACCESS_KEY')
+  ENV.delete('AWS_SESSION_TOKEN')
+  ENV['AWS_ACCESS_KEY_ID'] = profile_data['aws_access_key_id']
+  ENV['AWS_SECRET_ACCESS_KEY'] = profile_data['aws_secret_access_key']
+  aws_session_json = %x( aws --output json sts get-session-token --duration-seconds #{iam_key_duration} --token-code #{token_code} --serial-number arn:aws:iam::#{profile_data['iam_number']}:mfa/#{profile_data['iam_user']} 2>&1 )
+  begin
+    aws_session_data = JSON.parse(aws_session_json)
+  rescue Exception => e
+    puts 'Failed to parse JSON from amazon. Auth failure most likely occured.'
+    puts aws_session_json
+    exit 1
+  end
+
+  # Push this to our tokenization hash
+  @token_data[full_profile] = {
+    'aws_access_key_id' => aws_session_data['Credentials']['AccessKeyId'],
+    'aws_secret_access_key' => aws_session_data['Credentials']['SecretAccessKey'],
+    'aws_session_token' => aws_session_data['Credentials']['SessionToken'],
+    'expiration' => aws_session_data['Credentials']['Expiration']
+  }
+end
+
+# Function hits amazon and auths with mfa'd temp api keys to get temp api keys for a role
+def role_auth (full_profile, full_profile_parent, profile_data, session_role_user)
+  # Cleanup the current env variables, so we don't get confused
+  ENV.delete('AWS_ACCESS_KEY_ID')
+  ENV.delete('AWS_SECRET_ACCESS_KEY')
+  ENV.delete('AWS_SESSION_TOKEN')
+  ENV['AWS_ACCESS_KEY_ID'] = @token_data[full_profile_parent]['aws_access_key_id']
+  ENV['AWS_SECRET_ACCESS_KEY'] = @token_data[full_profile_parent]['aws_secret_access_key']
+  ENV['AWS_SESSION_TOKEN'] = @token_data[full_profile_parent]['aws_session_token']
+  aws_session_json = %x( aws --output json sts assume-role --role-arn arn:aws:iam::#{profile_data['iam_number']}:role/#{profile_data['iam_role']} --role-session-name #{session_role_user} 2>&1 )
+  begin
+    aws_session_data = JSON.parse(aws_session_json)
+  rescue Exception => e
+    puts 'Failed to parse JSON from amazon. Role auth failure most likely occured.'
+    puts aws_session_json
+    exit 1
+  end
+
+  # Push this to our tokenization hash
+  @token_data[full_profile] = {
+    'aws_access_key_id' => aws_session_data['Credentials']['AccessKeyId'],
+    'aws_secret_access_key' => aws_session_data['Credentials']['SecretAccessKey'],
+    'aws_session_token' => aws_session_data['Credentials']['SessionToken'],
+    'expiration' => aws_session_data['Credentials']['Expiration']
+  }
+end
+
+## TODO: Need a way to execute the bottom config/credentials generation
+#        on a lack of input
+# Input should be
+# <script> <profile-name> <token code>
+# Get input
+if ARGV[0].nil?
+  puts 'Missing profile name'
+  puts "Syntax #{$0} <profile name> <token code>"
+  puts list_profiles
+  exit 1
+end
+
+# We have data, set it now
+profile_name = ARGV[0]
+
+# The logic flow
+# First, get the profile we searched for
+full_profile, profile_data_one = find_profile(profile_name)
+# Check if this is a role account (denoted by the presence of the 'parent_account' attribute)
+if profile_data_one['parent_account']
+  # We are a role account
+  # 1 - Fetch the parent account
+  full_profile_parent, profile_data_parent = find_profile(profile_data_one['parent_account'])
+  # 2 - Check if our parent accounts keys are current
+  unless keys_valid(full_profile_parent)
+    # 2a - Check if we receieved a token code
+    if ARGV[1].nil?
+      puts 'Missing token code'
+      puts "Syntax #{$0} <profile name> <token code>"
+      exit 1
+    end
+    token_code = ARGV[1]
+    # 2b - Renew parent account keys if they are expired
+    # TODO: Inline with in the function, do better handing of this
+    mfa_auth(full_profile_parent, profile_data_parent, iam_key_duration, token_code)
+  end
+  # 3 - we can now (mostly) safely assume we have valid keys for the parent account
+  # Check if the keys are valid for this role account
+  if keys_valid(full_profile)
+    # They're still good
+    # TODO: Add notification if we renew mfa auth vs. renewing role auth
+    puts "Stored AWS Keys are still GOOD for selected profile (#{full_profile}). Not fetching new Role keys."
+    exit 0
+  else
+    # They need renewed
+    # Note: This method completely relies upon & assumes that mfa_auth is already done for the parent account
+    role_auth(full_profile, full_profile_parent, profile_data_one, profile_data_parent['iam_user'])
+  end
+# Check for regular MFA account
+elsif profile_data_one['iam_user']
+  # Check if the keys are still good 
+  if keys_valid(full_profile)
+    # They're still good
+    puts "Stored AWS Keys are still GOOD for selected profile (#{full_profile}). Not fetching new Role keys."
+    exit 0
+  else
+    # They need renewed
+    # TODO: This is a duplicate of the above.. laaame
+    if ARGV[1].nil?
+      puts 'Missing token code'
+      puts "Syntax #{$0} <profile name> <token code>"
+      exit 1
+    end
+    token_code = ARGV[1]
+    mfa_auth(full_profile, profile_data_one, iam_key_duration, token_code)
+  end
+end
+# Other situations might be root keys, which require no action that would be handled here
+
+
+####!!!! BELOW IS SAFE (from auth types logic) !!!!####
+# Write this data back out to the file
+# TODO: Add exception handling around this
+File.open(@tokenization_file, 'w') { |f| f.write(@token_data.to_json) }
+
+# Build the credential file
+creds = ''
+@master_data.each do |profile, data|
+  creds = creds.to_s + '[' + profile.to_s + ']' + "\n"
+  if !@token_data[profile].nil?
+    # Write tokenized params (if we have them)
+    creds = creds.to_s + 'aws_access_key_id = ' + @token_data[profile]['aws_access_key_id'].to_s + "\n"
+    creds = creds.to_s + 'aws_secret_access_key = ' + @token_data[profile]['aws_secret_access_key'].to_s + "\n"
+    creds = creds.to_s + 'aws_session_token = ' + @token_data[profile]['aws_session_token'].to_s + "\n"
+  else
+    # Otherwise write permanent IAM params
+    creds = creds.to_s + 'aws_access_key_id = ' + data['aws_access_key_id'].to_s + "\n"
+    creds = creds.to_s + 'aws_secret_access_key = ' + data['aws_secret_access_key'].to_s + "\n"
+  end
+end
+
+# Build the config file
+config = ''
+@master_data.each do |profile, data|
+  # Only add the profile if it has additional params defined
+  if !data['region'].nil? or !data['output'].nil?
+    config = config.to_s + '[profile ' + profile.to_s + ']' + "\n"
+    # Otherwise write permanent IAM params
+    config = config.to_s + 'region = ' + data['region'].to_s + "\n"
+    config = config.to_s + 'output = ' + data['output'].to_s + "\n"
+  end
+end
+
+# Write the new credentials file
+# TODO: Add exception handling here
+File.open(credentials_file, 'w') { |f| f.write(creds) }
+
+# Write the new config file
+# TODO: Add exception handling here
+File.open(config_file, 'w') { |f| f.write(config) }
