@@ -1,4 +1,4 @@
-#!/usr/local/bin/ruby
+#!/usr/bin/env ruby
 #
 #
 # This serves to get new aws session tokens and save them out as necessary
